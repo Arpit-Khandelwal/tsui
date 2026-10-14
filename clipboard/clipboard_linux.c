@@ -9,6 +9,59 @@
 // sendStatus is a function from the Go side. Must only be called once per handle.
 extern void sendStatus(uintptr_t statusHandle, int value);
 
+// libX11 is loaded at runtime instead of being linked, so that tsui can still start on
+// systems without X11 installed (e.g. headless servers). Only the clipboard needs it.
+static Display *(*pXOpenDisplay)(const char *);
+static int (*pXCloseDisplay)(Display *);
+static Window (*pXDefaultRootWindow)(Display *);
+static Window (*pXCreateSimpleWindow)(Display *, Window, int, int, unsigned int, unsigned int,
+                                      unsigned int, unsigned long, unsigned long);
+static Atom (*pXInternAtom)(Display *, const char *, Bool);
+static int (*pXSetSelectionOwner)(Display *, Atom, Window, Time);
+static Window (*pXGetSelectionOwner)(Display *, Atom);
+static int (*pXNextEvent)(Display *, XEvent *);
+static int (*pXChangeProperty)(Display *, Window, Atom, Atom, int, int, const unsigned char *, int);
+static Status (*pXSendEvent)(Display *, Window, Bool, long, XEvent *);
+
+// Loads libX11 and resolves the functions we need. Returns true on success. Callers are
+// serialized by the lock on the Go side.
+static bool loadX11(void)
+{
+    static bool loaded = false;
+    if (loaded)
+    {
+        return true;
+    }
+
+    void *lib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
+    if (lib == NULL)
+    {
+        lib = dlopen("libX11.so", RTLD_LAZY | RTLD_LOCAL);
+    }
+    if (lib == NULL)
+    {
+        return false;
+    }
+
+    if ((pXOpenDisplay = dlsym(lib, "XOpenDisplay")) == NULL ||
+        (pXCloseDisplay = dlsym(lib, "XCloseDisplay")) == NULL ||
+        (pXDefaultRootWindow = dlsym(lib, "XDefaultRootWindow")) == NULL ||
+        (pXCreateSimpleWindow = dlsym(lib, "XCreateSimpleWindow")) == NULL ||
+        (pXInternAtom = dlsym(lib, "XInternAtom")) == NULL ||
+        (pXSetSelectionOwner = dlsym(lib, "XSetSelectionOwner")) == NULL ||
+        (pXGetSelectionOwner = dlsym(lib, "XGetSelectionOwner")) == NULL ||
+        (pXNextEvent = dlsym(lib, "XNextEvent")) == NULL ||
+        (pXChangeProperty = dlsym(lib, "XChangeProperty")) == NULL ||
+        (pXSendEvent = dlsym(lib, "XSendEvent")) == NULL)
+    {
+        dlclose(lib);
+        return false;
+    }
+
+    loaded = true;
+    return true;
+}
+
 // Writes `n` bytes from `buf` to the clipboard. Sends an int to the passed `statusHandle`
 // (which must be a handle to a Go channel) exactly once: negative for failure, 0 for
 // success copying.
@@ -20,11 +73,18 @@ extern void sendStatus(uintptr_t statusHandle, int value);
 // @see https://www.uninformativ.de/blog/postings/2017-04-02/0/POSTING-en.html
 void writeString(unsigned char *buf, size_t n, uintptr_t statusHandle)
 {
+    if (!loadX11())
+    {
+        // libX11 isn't available.
+        sendStatus(statusHandle, -3);
+        return;
+    }
+
     // Attempt to open an X display.
     Display *display = NULL;
     for (int i = 0; i < 42; i++)
     {
-        display = XOpenDisplay(0);
+        display = pXOpenDisplay(0);
         if (display == NULL)
         {
             continue;
@@ -39,18 +99,18 @@ void writeString(unsigned char *buf, size_t n, uintptr_t statusHandle)
     }
 
     // Create an invisible window to use as an agent for clipboard operations.
-    Window window = XCreateSimpleWindow(display, XDefaultRootWindow(display), 0, 0, 1, 1, 0, 0, 0);
+    Window window = pXCreateSimpleWindow(display, pXDefaultRootWindow(display), 0, 0, 1, 1, 0, 0, 0);
 
-    Atom clipboardAtom = XInternAtom(display, "CLIPBOARD", false);
-    Atom utf8Atom = XInternAtom(display, "UTF8_STRING", false);
-    Atom targetsAtom = XInternAtom(display, "TARGETS", false);
+    Atom clipboardAtom = pXInternAtom(display, "CLIPBOARD", false);
+    Atom utf8Atom = pXInternAtom(display, "UTF8_STRING", false);
+    Atom targetsAtom = pXInternAtom(display, "TARGETS", false);
 
     // Set our window as the owner of the clipboard.
-    XSetSelectionOwner(display, clipboardAtom, window, CurrentTime);
-    if (XGetSelectionOwner(display, clipboardAtom) != window)
+    pXSetSelectionOwner(display, clipboardAtom, window, CurrentTime);
+    if (pXGetSelectionOwner(display, clipboardAtom) != window)
     {
         // We couldn't set ourself as the owner.
-        XCloseDisplay(display);
+        pXCloseDisplay(display);
         sendStatus(statusHandle, -2);
         return;
     }
@@ -60,7 +120,7 @@ void writeString(unsigned char *buf, size_t n, uintptr_t statusHandle)
     XEvent event;
     while (true)
     {
-        XNextEvent(display, &event);
+        pXNextEvent(display, &event);
 
         switch (event.type)
         {
@@ -92,17 +152,17 @@ void writeString(unsigned char *buf, size_t n, uintptr_t statusHandle)
             if (ev.target == utf8Atom)
             {
                 // Reply with our string.
-                error = XChangeProperty(ev.display, ev.requestor, ev.property,
-                                        utf8Atom, 8, PropModeReplace,
-                                        buf, n);
+                error = pXChangeProperty(ev.display, ev.requestor, ev.property,
+                                         utf8Atom, 8, PropModeReplace,
+                                         buf, n);
             }
             else if (ev.target == targetsAtom)
             {
                 // Reply with the targets we support (only UTF-8).
                 Atom targets[] = {utf8Atom};
-                error = XChangeProperty(ev.display, ev.requestor, ev.property,
-                                        XA_ATOM, 32, PropModeReplace,
-                                        (unsigned char *)&targets, sizeof(targets) / sizeof(Atom));
+                error = pXChangeProperty(ev.display, ev.requestor, ev.property,
+                                         XA_ATOM, 32, PropModeReplace,
+                                         (unsigned char *)&targets, sizeof(targets) / sizeof(Atom));
             }
             else
             {
@@ -113,7 +173,7 @@ void writeString(unsigned char *buf, size_t n, uintptr_t statusHandle)
             // Send the event if XChangeProperty either succeeded or didn't run.
             if ((error & 2) == 0)
             {
-                XSendEvent(display, ev.requestor, 0, 0, (XEvent *)&ev);
+                pXSendEvent(display, ev.requestor, 0, 0, (XEvent *)&ev);
             }
 
             break;
