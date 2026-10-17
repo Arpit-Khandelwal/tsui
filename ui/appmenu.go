@@ -178,5 +178,8 @@ func (appmenu *Appmenu) IsSubmenuOpen() bool {
 // Close the submenu.
 func (appmenu *Appmenu) CloseSubmenu() {
 	appmenu.isOpen = false
+	if len(appmenu.items) == 0 {
+		return
+	}
 	appmenu.items[appmenu.cursor].Submenu.ResetCursor()
 }
