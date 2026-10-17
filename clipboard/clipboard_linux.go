@@ -1,7 +1,7 @@
 package clipboard
 
 /*
-#cgo LDFLAGS: -lX11
+#cgo LDFLAGS: -ldl
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
